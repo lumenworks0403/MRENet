@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="127" height="20" role="img" aria-label="Framework: PyTorch">
+  <title>Framework: PyTorch</title>
+  <path fill="#555" d="M0 0h71v20H0z"/>
+  <path fill="#ee4c2c" d="M71 0h56v20H71z"/>
+  <g fill="#fff" text-anchor="middle" font-family="Verdana,DejaVu Sans,sans-serif" font-size="11">
+    <text x="35.5" y="14">Framework</text>
+    <text x="99.0" y="14">PyTorch</text>
+  </g>
+</svg>
