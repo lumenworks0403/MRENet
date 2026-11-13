@@ -29,7 +29,7 @@ def main():
     ap.add_argument("--out", default="vis.jpg")
     ap.add_argument("--short-side", type=int, default=800)
     ap.add_argument("--max-size", type=int, default=1333)
-    ap.add_argument("--hed-mask-mode", choices=("avg", "last"), default=None)
+    ap.add_argument("--sped-mask-mode", "--hed-mask-mode", dest="hed_mask_mode", choices=("avg", "last"), default=None)
     args = ap.parse_args()
 
     ck = torch.load(args.ckpt, map_location="cpu")
@@ -72,7 +72,7 @@ def main():
     vis[mask] = vis[mask] * 0.5 + np.array([255, 0, 0]) * 0.5
     Image.fromarray(vis.astype(np.uint8)).save(args.out)
     print({
-        "num_targets": len(r["queries"]),
+        "num_targets": len(r["boxes"]),
         "scores": [round(v, 3) for v in r["scores"]],
         # score_type 标明 scores 的含义 ("ref_score" = 新评分头, "token" = 原 token 均分);
         # 新模式下 token_scores 只是诊断值, 不参与选择。

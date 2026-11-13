@@ -22,4 +22,4 @@ python -c "import torch; print('PyTorch:', torch.__version__, 'CUDA:', torch.ver
 python -m pip install -r requirements.txt
 bash scripts/build_groundingdino.sh
 bash scripts/download_weights.sh
-echo "基础环境安装完成。启用 MMSCopE 时继续运行 bash scripts/setup_mmscope.sh。"
+echo "基础环境安装完成。MCPE 使用 PyTorch 扫描，无需额外编译扫描扩展。"

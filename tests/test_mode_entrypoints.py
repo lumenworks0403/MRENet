@@ -117,23 +117,23 @@ class TestMode(unittest.TestCase):
 
     def test_model_variant(self):
         self.assertEqual(model_variant({"use_hed": False}), "B0")
-        self.assertEqual(model_variant({"use_hed": True, "use_dn": False}), "HED-structure/no-DN")
-        self.assertEqual(model_variant({"use_hed": True, "use_dn": True}), "HED+DN")
+        self.assertEqual(model_variant({"use_hed": True, "use_dn": False}), "SPED/no-DN")
+        self.assertEqual(model_variant({"use_hed": True, "use_dn": True}), "SPED+DN")
         self.assertEqual(model_variant({
             "use_hed": True,
             "use_mmscope": True
-        }), "HED-structure/no-DN+MM")
+        }), "SPED/no-DN+MCPE")
         self.assertEqual(model_variant({
             "use_hed": True,
             "use_ref_score": True
-        }), "HED-structure/no-DN+Score")
+        }), "SPED/no-DN+RCA")
         self.assertEqual(
             model_variant({
                 "use_hed": True,
                 "use_dn": True,
                 "use_mmscope": True,
                 "use_ref_score": True
-            }), "HED+DN+MM+Score")
+            }), "SPED+DN+MCPE+RCA")
 
     # ---- MM / 评分头模式 (2026-10-16) ----
     def test_mm_score_default_off_and_legacy(self):

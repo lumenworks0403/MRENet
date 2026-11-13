@@ -1,19 +1,5 @@
-"""MMSCopE 像素支路与 RefScoreHead 的控制流 / 形状 / 损失测试 (CPU, 不需要 CUDA 与扫描算子)。
-
-    python tests/test_mm_score.py
-
-覆盖:
-  1. RefScoreHead 输出形状 (B=1 / Q=1 时不丢维)。
-  2. 评分损失: 标签来自各层自己的匹配结果、归一化、无目标 batch 可反传、
-     进入 total loss、辅助层后缀能找到权重、缺字段报错、DN 不增加评分损失。
-  3. 后处理: 新评分决定 q*、六层同一索引的掩码集成、token 分数只作诊断、缺字段报错。
-  4. MMSCopEPixelDecoder: 非方形/非整除尺寸下 pad→裁回 的输出尺寸与 c4 对齐,
-     以及梯度能从 pix 回传到 c4 / enc_maps (真实 SS2D 用桩替换, 只验证接线与几何)。
-  5. init_model_weights 的键差异规则。
-
-注意: 第 4 项把 VSSMBlock 换成了桩, 不构成对真实 selective scan 的验证;
-真实算子的前向/反向在 tools/smoke_mm_score.py (需 GPU + 编译好的扩展) 里跑。
-"""
+"""RCA 损失、MCPE 几何、训练梯度报告和权重加载回归测试。
+真实扫描及逐组选择见 test_paper_logic.py。"""
 import os
 import sys
 import unittest
@@ -236,114 +222,6 @@ class TestRefScoreLoss(unittest.TestCase):
         self.assertFalse([k for k in ld if "ref_score" in k and "_dn" in k])
 
 
-@unittest.skipIf(_ERR is not None, f"criterion/evaluate 导入失败 (需服务器环境): {_ERR}")
-class TestPostprocessRefScore(unittest.TestCase):
-    H4 = W4 = 4
-
-    def _outputs(self, ref_logits=None):
-        tok = _tokenized()
-        # token 分数故意让查询 0 最高, 新评分让另一个查询最高, 以便区分两条路径
-        logits = torch.full((L, B, Q, 256), -10.0)
-        logits[:, :, 0, 1:3] = 10.0
-        embeds = torch.randn(L, B, Q, 3)
-        out = {
-            "hed_all_logits": logits,
-            "hed_all_boxes": torch.rand(L, B, Q, 4) * 0.4 + 0.3,
-            "hed_mask_embeds": embeds,
-            "hed_pix": torch.randn(B, 3, self.H4, self.W4),
-            "pred_masks": torch.randn(B, Q, self.H4, self.W4),
-            "tokenized": tok,
-            "text_token_mask": tok["attention_mask"].bool(),
-            "pad_mask": torch.zeros(B, self.H4 * 4, self.W4 * 4, dtype=torch.bool)
-        }
-        if ref_logits is not None:
-            out["hed_all_ref_logits"] = ref_logits
-        return out
-
-    def _targets(self):
-        return [{
-            "size": torch.tensor([self.H4 * 4, self.W4 * 4]),
-            "orig_size": torch.tensor([self.H4 * 4, self.W4 * 4]),
-            "orig_mask": torch.zeros(self.H4 * 4, self.W4 * 4, dtype=torch.bool),
-            "orig_boxes": torch.zeros(0, 4)
-        } for _ in range(B)]
-
-    def test_new_score_decides_q_star(self):
-        ref = torch.full((L, B, Q), -5.0)
-        ref[:, 0, 3] = 5.0  # 第 0 张图: 新评分选查询 3
-        ref[:, 1, 2] = 5.0  # 第 1 张图: 新评分选查询 2
-        out, tg = self._outputs(ref), self._targets()
-        res = postprocess_hed(out, tg, use_ref_score=True)
-        self.assertEqual([r["queries"][0] for r in res], [3, 2])
-        self.assertEqual([r["score_type"] for r in res], ["ref_score"] * B)
-        # 关掉新评分 -> 回到 token 均分, 选查询 0
-        res_old = postprocess_hed(out, tg, use_ref_score=False)
-        self.assertEqual([r["queries"][0] for r in res_old], [0, 0])
-        self.assertEqual(res_old[0]["score_type"], "token")
-        self.assertNotIn("token_scores", res_old[0])
-
-    def test_scores_are_the_ones_used_and_token_kept_as_diagnostic(self):
-        ref = torch.full((L, B, Q), -5.0)
-        ref[:, :, 1] = 1.0
-        res = postprocess_hed(self._outputs(ref), self._targets(), use_ref_score=True)
-        expect = ref.float().sigmoid().mean(0)[0, 1].item()
-        self.assertAlmostEqual(res[0]["scores"][0], expect, places=6)  # scores = 实际选择依据
-        self.assertIn("token_scores", res[0])  # 旧分数仅作诊断
-        self.assertNotAlmostEqual(res[0]["token_scores"][0], expect, places=3)
-
-    def test_changing_ref_logits_changes_selection(self):
-        base = torch.full((L, B, Q), -5.0)
-        base[:, :, 1] = 5.0
-        r1 = postprocess_hed(self._outputs(base), self._targets(), use_ref_score=True)
-        moved = base.clone()
-        moved[:, :, 1] = -5.0
-        moved[:, :, 4] = 5.0
-        r2 = postprocess_hed(self._outputs(moved), self._targets(), use_ref_score=True)
-        self.assertEqual([r["queries"][0] for r in r1], [1, 1])
-        self.assertEqual([r["queries"][0] for r in r2], [4, 4])
-
-    def test_mask_uses_same_query_index_across_layers(self):
-        """q* 选定后, 六层掩码必须取同一个查询索引, 且是"逐层 sigmoid 再平均概率"
-        (不是先平均 mask embedding, 也不是 logit 平均后 sigmoid)。"""
-        from rrs.evaluate import _restore_mask
-        ref = torch.full((L, B, Q), -5.0)
-        ref[:, :, 2] = 5.0
-        out = self._outputs(ref)
-        res = postprocess_hed(out, self._targets(), use_ref_score=True, mask_mode="avg")
-        q = res[0]["queries"][0]
-        self.assertEqual(q, 2)
-        hw = (self.H4 * 4, self.W4 * 4)
-
-        def restore(m):  # m: (H4,W4) logits -> (h0,w0) logits, 与 _restore_mask 同一路径
-            return _restore_mask(m[None, None].float(), hw, hw[0], hw[1], hw[0], hw[1])[0]
-
-        layer_logits = [
-            torch.einsum("c,chw->hw", out["hed_mask_embeds"][l, 0, q], out["hed_pix"][0])
-            for l in range(L)
-        ]
-        want = torch.stack([restore(m).sigmoid() for m in layer_logits]).mean(0) > 0.5
-        self.assertTrue(torch.equal(res[0]["mask"], want))
-        # 概率平均不等于"先平均 embedding 再算掩码": 两者的概率图应有差异
-        avg_embed = out["hed_mask_embeds"][:, 0, q].mean(0)
-        prob_avg = torch.stack([restore(m).sigmoid() for m in layer_logits]).mean(0)
-        prob_embed = restore(torch.einsum("c,chw->hw", avg_embed, out["hed_pix"][0])).sigmoid()
-        self.assertGreater((prob_avg - prob_embed).abs().max().item(), 1e-6)
-        # mask_mode="last" 仍走最后一层全查询掩码的老路径, q* 不变
-        res_last = postprocess_hed(out, self._targets(), use_ref_score=True, mask_mode="last")
-        self.assertEqual(res_last[0]["queries"][0], 2)
-        want_last = restore(out["pred_masks"][0, q]).sigmoid() > 0.5
-        self.assertTrue(torch.equal(res_last[0]["mask"], want_last))
-
-    def test_missing_ref_logits_raises(self):
-        with self.assertRaises(ValueError):
-            postprocess_hed(self._outputs(None), self._targets(), use_ref_score=True)
-
-    def test_multi_mode_still_rejected(self):
-        ref = torch.full((L, B, Q), 0.0)
-        with self.assertRaises(NotImplementedError):
-            postprocess_hed(self._outputs(ref), self._targets(), mode="multi", use_ref_score=True)
-
-
 class _StubVSSMBlock(nn.Module):
     """桩: 只保留 "输入输出同形状且可导" 这一点, 替换真实 SS2D 以便在 CPU 上验证接线与几何。
     绝不代表真实 selective scan 的数值; 真实算子见 tools/smoke_mm_score.py。"""
@@ -359,7 +237,7 @@ class _StubVSSMBlock(nn.Module):
 class TestMMSCopEPixelDecoder(unittest.TestCase):
 
     def _build(self, **kw):
-        with patch("rrs.mmscope_pixel_decoder.VSSMBlock", _StubVSSMBlock):
+        with patch("rrs.mcpe.ScanBlock", _StubVSSMBlock):
             from rrs.mmscope_pixel_decoder import MMSCopEPixelDecoder
             return MMSCopEPixelDecoder(c4_channels=96, enc_dim=32, out_dim=16, channels=32,
                                        feat_proj_dim=32, gn_groups=8, scan_fp32=False, **kw)
@@ -403,18 +281,13 @@ class TestMMSCopEPixelDecoder(unittest.TestCase):
         self.assertNotIn(".detach()", src)
         self.assertNotIn("no_grad", src)
 
-    def test_requires_real_ops(self):
-        """不打桩时必须用真实 VSSMBlock; 缺算子环境下报错而不是静默退化。"""
-        import rrs.mmscope_pixel_decoder as mpd  # 导入时把 third_party/SegMAN 加入 sys.path
-        from segman.mmscope_core import require_scan_ops
-        self.assertIs(mpd.MMSCopEPixelDecoder.__mro__[0], mpd.MMSCopEPixelDecoder)
-        self.assertEqual(mpd.VSSMBlock.__module__, "segman.mmscope_core")
-        try:
-            require_scan_ops()
-        except ImportError as e:
-            self.assertIn("selective_scan", str(e))
-        else:
-            self.skipTest("本环境已装好真实算子, 由 smoke_mm_score.py 覆盖")
+    def test_real_scan_is_local_pytorch(self):
+        from rrs.mcpe import MCPEPixelDecoder
+        from rrs.selective_scan import SS2D
+        dec = MCPEPixelDecoder(8, enc_dim=8, out_dim=8, channels=8,
+                               feat_proj_dim=8, gn_groups=2)
+        self.assertIsInstance(dec.vssm.token_mixer, SS2D)
+
 
 
 class TestGradReportLogic(unittest.TestCase):

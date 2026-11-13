@@ -44,7 +44,7 @@ def load_cfg(path, opts=None):
         target = cfg
         parts = key.split(".")
         for part in parts[:-1]:
-            target = target.setdefault(part, {}) if part in ("dn", "mm") else target[part]
+            target = target.setdefault(part, {}) if part in ("dn", "mm", "mcpe") else target[part]
             if not isinstance(target, dict):
                 raise ValueError(f"配置项 {key} 的父项不是字典")
         target[parts[-1]] = value

@@ -1,421 +1,110 @@
-<div align="center">
-
 # MRENet
 
-### Low-Altitude UAV Referring Image Segmentation<br>via Multiscale Contextual Pixel Enhancement<br>and Referentially Guided Ensemble Prediction
+面向低空无人机指代分割，按照所提供论文的方法第 3 节组织为 MCPE、SPED 和 RCA。
+输入图像和自然语言表达，输出单个指代目标的二值掩码。
 
-**Shuo Zhang · Quanzhen Chen · Li Yu · Ming Li**<br>
-**Haoyu Pan · Yilin Li · Zhiyi Shi · Edmond Q. Wu**
+## 方法
 
-**Multiscale context. Parallel decoding. Referential candidate selection.**
+- **MCPE**：图文融合后的 1/8、1/16、1/32 特征独立投影并对齐；三路空间重编码后进行二维选择性扫描；将上下文重新注入三组 stage 特征，再与 1/4 浅层特征融合。
+- **SPED**：保留六个预训练解码层，重连为一层共享加五个独立并行分支。分支读取共享查询，参考框在送入分支时停止梯度。保留共享层和五个分支，共六组候选。
+- **DN**：仅训练时生成正负目标重建查询；普通查询不能读取 DN，DN 组间隔离。每个并行分支以 0.5 概率重新生成整批 DN 输入；概率为 0 时仍计算 DN 损失。
+- **RCA**：六组共享 `Linear(D,D) → ReLU → Linear(D,1)` 评分头，各组独立选取最高分查询。每张选中掩码先恢复原图尺寸，再 sigmoid，最后对六张概率掩码等权平均并按 `> 0.5` 阈值化。
 
-![Task](assets/badges/task.svg)
-![Domain](assets/badges/domain.svg)
-![Framework](assets/badges/framework.svg)
-![Encoders](assets/badges/encoders.svg)
+源代码按论文实现；PDF 未唯一指定的扫描块内部参数化记录在 [实现说明](docs/IMPLEMENTATION.md)。不附带训练数据或训练后权重。
 
-**[Prepare Data](#data-preparation) &nbsp;·&nbsp; [Getting Started](#getting-started)**
+## 安装
 
-[Dataset](#dataset) &nbsp;·&nbsp; [Overview](#overview) &nbsp;·&nbsp; [Method](#method) &nbsp;·&nbsp; [Results](#results) &nbsp;·&nbsp; [Getting Started](#getting-started) &nbsp;·&nbsp; [Code Guide](#code-guide)
-
-</div>
-
----
-
-## Dataset
-
-**RIS-LAD** is the primary benchmark for low-altitude UAV referring image segmentation in this study. It covers eight object categories, including pedestrians, vehicles, and vessels. Each sample pairs an image with a natural-language expression and the mask of the referred target. Small objects, dense groups of similar instances, and complex backgrounds make precise segmentation challenging.
-
-The manuscript uses the original RIS-LAD splits for training, model selection, and testing, and evaluates few-shot transfer on **RefSegRS** and **RRSIS-D**. Counts below are referring samples from Table 1.
-
-| Dataset | Train | Validation | Test | Role |
-| :--- | ---: | ---: | ---: | :--- |
-| **RIS-LAD** | 9,712 | 1,396 | 2,763 | Source training and primary evaluation |
-| **RefSegRS** | 2,172 | 431 | 1,817 | Few-shot adaptation and transfer evaluation |
-| **RRSIS-D** | 12,181 | 1,740 | 3,481 | Few-shot adaptation and transfer evaluation |
-
-Target-domain training counts describe the sampling pools. The main transfer experiments use **100 training annotations + 20 validation annotations per target domain**, with results averaged over three random seeds.
-
-<details>
-<summary><b>Data availability and valid samples</b></summary>
-
-Obtain each dataset from its original provider, then follow [Prepare Data](#data-preparation). This repository does not redistribute dataset images or annotations.
-
-The conversion described in the manuscript retains all RefSegRS samples. After removing RRSIS-D records with empty masks or inconsistent image/mask dimensions, the effective train, validation, and test counts are **12,170 / 1,738 / 3,477**. Record the effective sample counts when reporting results.
-
-Dataset layouts and conversion details are documented in the [data conversion notes](docs/数据集格式转换说明_20261025.md).
-
-</details>
-
-## Overview
-
-MRENet segments the target specified by a natural-language expression in low-altitude UAV imagery. It addresses two related challenges: **limited spatial detail in small targets** and **ambiguity among visually similar instances**.
-
-Built on GroundingDINO, the framework uses **MCPE** to enhance pixel representations, **SPED** to produce multiple query sets, and **RCA** to assess referential relevance before mask aggregation.
-
-<table align="center">
-  <tr>
-    <th align="center">48.85%</th>
-    <th align="center">52.41%</th>
-    <th align="center">+6.17 pp</th>
-  </tr>
-  <tr>
-    <td align="center">RIS-LAD Test mIoU</td>
-    <td align="center">RIS-LAD Test oIoU</td>
-    <td align="center">mIoU gain over B0</td>
-  </tr>
-</table>
-
-<p align="center"><sub>Results reported in Tables 2 and 4 of the manuscript; not newly reproduced measurements from this code release.</sub></p>
-
-## Method
-
-<p align="center">
-  <a href="assets/figures/figure1-overview.png">
-    <img src="assets/figures/figure1-overview.png" alt="Figure 1: MRENet architecture, including visual and text encoding, MCPE, SPED, RCA, and mask aggregation" width="100%">
-  </a>
-</p>
-
-<p align="center"><sub><b>Figure 1. Overall framework.</b> Click the image for the full-resolution version, or open the <a href="assets/figures/figure1-overview.pdf">vector PDF</a> to zoom in.</sub></p>
-
-| Component | Role |
-| :--- | :--- |
-| **GroundingDINO · Swin-T + BERT** | Extract visual and text features and initialize cross-modal queries for target localization. |
-| **Multiscale Contextual Pixel Enhancement (MCPE)** | Combine multiscale context re-encoding with shallow-detail fusion to enhance pixel features for mask prediction. |
-| **Shared Parallel Ensemble Decoder (SPED)** | Use one shared layer and five independently parameterized parallel layers to produce six query sets. |
-| **Referential Candidate Assessment (RCA)** | Score candidate queries for referential relevance to support target selection. |
-| **Auxiliary denoising (DN)** | Supervise perturbed queries, with stochastic regeneration of branch-specific denoising inputs. |
-| **Probability-mask aggregation** | Restore selected masks to the original image size and combine their probabilities before binarization. |
-
-The implementation retains the historical **B0_HED** layout. `MMSCopE`, `HED`, and `RefScoreHead` identify the pixel-enhancement, decoder, and candidate-scoring implementations. See the [Code Guide](#code-guide).
-
-<details>
-<summary><b>Implementation and reproduction status</b></summary>
-
-This release organizes the existing implementation while preserving its behavior. Full manuscript alignment and independent benchmark reproduction remain pending.
-
-- **Candidate selection:** the manuscript selects a candidate independently in each output layer. The current `rrs/evaluate.py` averages candidate scores across six layers and selects one shared query index. This difference needs to be reconciled with the original experiment records.
-- **Training recipe:** the manuscript uses 50 epochs, batch size 4, no gradient accumulation, and DN. The existing combined configuration defaults to 12 epochs, batch size 2 with two accumulation steps, and DN disabled. Commands below run the current configurations.
-- **Few-shot transfer:** dataset readers and standard training configurations are available; the complete three-seed, nested-budget, two-stage adaptation protocol is not yet included.
-- **Validation:** unit tests check implementation behavior. Full training, real SS2D CUDA execution, and benchmark results require separate GPU validation. Trained task checkpoints are not included.
-
-</details>
-
-## Results
-
-### RIS-LAD benchmark
-
-**Test results from Table 2 of the manuscript.** Values are percentages; higher is better.
-
-| Method | mIoU ↑ | oIoU ↑ |
-| :--- | ---: | ---: |
-| LAVT | 30.14 | 41.97 |
-| ASDA | 33.33 | 37.53 |
-| RMSIN | 39.60 | 48.82 |
-| VATEX | 18.53 | 24.27 |
-| LGCE | 26.17 | 40.75 |
-| FIANet | 37.44 | 43.39 |
-| RSRefSeg | 41.16 | 47.71 |
-| CADFormer | 39.32 | 46.47 |
-| SAARN | 41.67 | 49.60 |
-| **MRENet (Ours)** | **48.85** | **52.41** |
-
-<details>
-<summary><b>Precision at different IoU thresholds</b></summary>
-
-Prec@X for the full model, from Table 2. It measures the percentage of samples with mask `IoU >= X`; these IoU cutoffs differ from the probability threshold used for binarization.
-
-| Prec@0.5 ↑ | Prec@0.6 ↑ | Prec@0.7 ↑ | Prec@0.8 ↑ | Prec@0.9 ↑ |
-| ---: | ---: | ---: | ---: | ---: |
-| 55.01 | 52.73 | 48.35 | 41.77 | 27.80 |
-
-</details>
-
-<details>
-<summary><b>Module and denoising ablations</b></summary>
-
-RIS-LAD test results from Table 4. B0 is the internal GroundingDINO-based baseline.
-
-| Configuration | MCPE | SPED | RCA | Denoising | mIoU ↑ | oIoU ↑ |
-| :--- | :---: | :---: | :---: | :--- | ---: | ---: |
-| A · B0 | — | — | — | Disabled | 42.68 | 48.37 |
-| B | ✓ | — | — | Disabled | 44.62 | 49.53 |
-| C | — | ✓ | — | Disabled | 44.03 | 49.28 |
-| D | ✓ | ✓ | — | Disabled | 45.86 | 50.26 |
-| E | ✓ | ✓ | ✓ | Disabled | 47.58 | 51.54 |
-| F | ✓ | ✓ | ✓ | Enabled, p = 0 | 48.32 | 52.01 |
-| **G · Full model** | **✓** | **✓** | **✓** | **Enabled, p = 0.5** | **48.85** | 52.41 |
-| H | ✓ | ✓ | ✓ | Enabled, p = 1 | 48.53 | **52.46** |
-
-`p` is the probability of regenerating the entire DN input set for a parallel branch. DN supervision remains active at `p = 0`. The full model improves mIoU and oIoU over B0 by **6.17** and **4.04 percentage points**, respectively.
-
-</details>
-
-<details>
-<summary><b>Few-shot transfer to remote sensing datasets</b></summary>
-
-Manuscript results with 100 training and 20 separate validation annotations per target domain, averaged over three seeds.
-
-| Target domain | Train / validation annotations | mIoU ↑ | oIoU ↑ |
-| :--- | :---: | ---: | ---: |
-| RefSegRS | 100 / 20 | 39.12 | 54.93 |
-| RRSIS-D | 100 / 20 | 38.46 | 49.08 |
-
-The two target domains are adapted independently from the RIS-LAD source model. Test sets are excluded from sampling, model selection, and threshold tuning. See the implementation-status note above for current protocol support.
-
-</details>
-
-## Getting Started
-
-### 1. Installation
-
-Run commands from the repository root. The full pixel-enhancement module requires **Linux, an NVIDIA GPU, Triton, and the real selective scan CUDA operator**.
+建议 Python 3.12；先安装与 CUDA 匹配的 PyTorch/torchvision，再安装其余依赖：
 
 ```bash
-conda create -n mrenet python=3.10 -y
-conda activate mrenet
-python -m pip install torch==2.4.1 torchvision==0.19.1 --index-url https://download.pytorch.org/whl/cu121
-python -m pip install -r requirements.txt
-bash scripts/build_groundingdino.sh
+pip install -r requirements.txt
 bash scripts/download_weights.sh
 ```
 
-When enabling `use_mmscope=True`, install and check SS2D:
+预训练权重路径为 `weights/groundingdino_swint_ogc.pth` 和 `weights/bert-base-uncased/`。
+MCPE 使用项目内的可微 PyTorch 扫描，支持 CPU 和 CUDA，不需要额外编译扫描扩展。
+GroundingDINO 的 deformable attention 未编译时会使用其 PyTorch 后备实现；CUDA 环境可运行 `bash scripts/build_groundingdino.sh` 编译以改善速度。
 
-```bash
-bash scripts/setup_mmscope.sh
-python tools/check_ss2d.py
-```
+## 数据与训练
 
-<details>
-<summary><b>Environment versions, server setup, and pretrained weights</b></summary>
-
-The commands above follow the current installation example; not every CUDA/GPU combination has been verified. The manuscript reports Python 3.12.3, PyTorch 2.8.0, CUDA 12.8, cuDNN 9.10.2, and an RTX 3080 Ti. Record the actual environment used for an experiment.
-
-Alternative setup scripts:
-
-```bash
-bash scripts/setup_server.sh
-bash scripts/setup_server.sh --existing-env
-bash scripts/setup_autodl.sh
-```
-
-Use `HF_ENDPOINT`, `CUDA_HOME`, and `TORCH_CUDA_ARCH_LIST` to configure downloads and compilation. The default PyTorch 2.4.1 setup supports `cu118`, `cu121`, and `cu124`. Compiling CUDA extensions requires a compatible CUDA toolkit and `nvcc`.
-
-Default pretrained-resource layout:
-
-```text
-weights/
-├── groundingdino_swint_ogc.pth
-└── bert-base-uncased/
-    ├── config.json
-    ├── vocab.txt
-    ├── tokenizer_config.json
-    ├── tokenizer.json
-    └── model.safetensors
-```
-
-Official GroundingDINO weights provide initialization, not a trained referring-segmentation checkpoint. Evaluation and prediction below require a checkpoint produced by the corresponding training run.
-
-Without the GroundingDINO `_C` extension, B0/HED can use the existing PyTorch attention path at reduced speed. The complete MMSCopE module still requires the real SS2D CUDA implementation; CPU tests do not validate it.
-
-</details>
-
-<a name="data-preparation"></a>
-
-### 2. Prepare data
-
-Place the original datasets under `data/`, then generate unified JSONL annotations:
+将 RIS-LAD 按原始目录结构放入 `data/RIS-LAD`，转换时保留官方划分：
 
 ```bash
 python tools/prepare_rislad.py --root data/RIS-LAD
-python tools/prepare_remote_sensing.py --dataset refsegrs --data-root data
-python tools/prepare_remote_sensing.py --dataset rrsisd --data-root data
+python tools/train.py --config configs/mrenet_rislad.py
 ```
 
-RIS-LAD layout:
-
-```text
-data/RIS-LAD/
-├── ris_lad/
-│   ├── instances.json
-│   └── refs(unc).p
-├── images/ris_lad/
-└── b0/                         # Generated annotations
-    ├── train.jsonl
-    ├── val.jsonl
-    └── test.jsonl
-```
-
-See the [data conversion notes](docs/数据集格式转换说明_20261025.md) for RefSegRS and RRSIS-D layouts.
-
-<details>
-<summary><b>Annotation format and other datasets</b></summary>
-
-Each JSONL row represents one referring expression. `image` is relative to `image_root`; `bbox` uses COCO `xywh` coordinates in pixels; `segmentation` accepts COCO polygons or RLE.
-
-```json
-{"image":"images/example.jpg","caption":"the car on the left","height":512,"width":512,"id":"sample_1","objects":[{"bbox":[10,20,30,40],"segmentation":[[10,20,40,20,40,60,10,60]]}]}
-```
-
-`objects` may be empty or contain multiple targets. RefCOCO supports the `jxu124/refcoco` parquet annotations. Run `python tools/convert_refdrone.py --help` for RefDrone options. Box-filled masks are for pipeline checks only, not substitutes for segmentation annotations.
-
-</details>
-
-### 3. Train
-
-Train the existing HED configuration:
+完整配置对应论文设置：短边 800、长边不超过 1333、禁止随机水平翻转、冻结 BERT、batch size 4、无梯度累积、50 epochs、第 30 epoch 后学习率乘 0.1、AdamW。
+骨干/其余模块初始学习率分别为 `1e-5/1e-4`，权重衰减 `1e-4`，启用 AMP 和 DN。
+资源受限时可显式覆盖 batch size，但这会偏离原实验设置。
 
 ```bash
-python tools/train.py --config configs/b0_hed_rislad.py
+python tools/train.py --config configs/mrenet_rislad.py --opts batch_size=1
+python tools/train.py --config configs/mrenet_rislad.py --resume work_dirs/mrenet_rislad/last.pth
+python tools/train.py --config configs/mrenet_rislad.py --eval-only --resume work_dirs/mrenet_rislad/best.pth
+python tools/infer.py --ckpt work_dirs/mrenet_rislad/best.pth --image example.jpg --text "the white car on the left" --out prediction.jpg
 ```
 
-Train HED + MMSCopE + the scoring head, explicitly enabling DN:
+推理输出叠加图和对应的 `_mask.png`。`queries`/`scores` 各含六项，代表每组选中的候选；它们共同生成一个目标掩码。
+
+## 配置与消融
+
+主配置采用 `use_sped/use_mcpe/use_rca`、`mcpe` 和 `sped_mask_mode`。
+内部保留 `use_hed/use_mmscope/use_ref_score`、`mm`、`hed_mask_mode` 作为兼容接口，分别映射到上述模块。
+两套字段均可用 `--opts` 显式覆盖；同一条命令建议只使用一套命名。
+原 `b0_*` 配置作为基线和历史消融保留，其训练轮数、batch size、DN 开关不自动等同完整论文配置。
 
 ```bash
-python tools/train.py --config configs/b0_hed_mm_score_rislad.py --opts use_dn=True
+# 关闭 RCA，采用每组有效 token 的最大匹配概率选择候选
+python tools/train.py --config configs/mrenet_rislad.py --opts use_rca=False
+# 保留 DN 监督，所有分支继承共享 DN
+python tools/train.py --config configs/mrenet_rislad.py --opts dn.reinit_rate=0
 ```
 
-These commands use the current recipes described in the implementation-status note. Logs and checkpoints are written to `output_dir`; model selection uses validation mIoU.
+RCA 必须与 SPED 同时开启。论文路径是单目标 top1；基线额外保留多目标能力。
 
-<details>
-<summary><b>Model configurations</b></summary>
+## 两阶段小样本迁移
 
-| Mode | RIS-LAD configuration | Notes |
-| :--- | :--- | :--- |
-| B0 | [b0_rislad.py](configs/b0_rislad.py) | Baseline |
-| HED | [b0_hed_rislad.py](configs/b0_hed_rislad.py) | Shared parallel decoder |
-| HED + DN | [b0_hed_dn_rislad.py](configs/b0_hed_dn_rislad.py) | DN is used only during training |
-| HED + MMSCopE | [b0_hed_mm_rislad.py](configs/b0_hed_mm_rislad.py) | Requires real SS2D |
-| HED + Score | [b0_hed_score_rislad.py](configs/b0_hed_score_rislad.py) | Referential scoring head |
-| HED + MMSCopE + Score | [b0_hed_mm_score_rislad.py](configs/b0_hed_mm_score_rislad.py) | DN disabled by default; enable explicitly |
-
-Configurations use `_base_ = "base.py"` inheritance and are loaded by `rrs.config.load_cfg()`. Dictionary fields are replaced as a whole; use `dict(train_data, max_samples=16)` or dotted command-line overrides for local changes.
-
-Current RIS-LAD defaults are `batch_size=1, grad_accum=1` for B0 and `batch_size=2, grad_accum=2` for HED. Match actual training settings in controlled comparisons. Equal effective batch sizes do not guarantee identical padding or numerical behavior.
-
-</details>
-
-<details>
-<summary><b>Resume training and initialize a different architecture</b></summary>
+按 PDF 第 4.5.1 节，分别从 RIS-LAD 验证集选出的权重适配 RefSegRS 和 RRSIS-D。
+先根据数据转换说明生成各目标域已清理的 `b0/train.jsonl`、`val.jsonl`、`test.jsonl`，然后固定抽样：
 
 ```bash
-# Restore the same architecture, optimizer, scheduler, and epoch
-python tools/train.py --config configs/b0_hed_rislad.py --resume work_dirs/b0_hed_rislad_noDN/last.pth --opts gdino_ckpt=None
-
-# Load compatible parameters; initialize newly added modules
-python tools/train.py --config configs/b0_hed_mm_score_rislad.py --init-from work_dirs/b0_hed_rislad_noDN/best.pth --opts gdino_ckpt=None
+python tools/prepare_fewshot.py --root data/RefSegRS
+python tools/prepare_fewshot.py --root data/RRSIS-D
+python tools/finetune.py --config configs/mrenet_refsegrs.py --source-ckpt work_dirs/mrenet_rislad/best.pth --shots 100 --seed 0 --eval-test
+python tools/finetune.py --config configs/mrenet_rrsisd.py --source-ckpt work_dirs/mrenet_rislad/best.pth --shots 100 --seed 0 --eval-test
 ```
 
-`--resume` restores the checkpoint's model mode, with explicit `--opts` taking precedence. `--init-from` uses the current configuration and cannot be combined with `--resume` or `--eval-only`. Current resume behavior does not guarantee bitwise equivalence to uninterrupted training.
+预算以完整指代样本计数；每张原始图像只取一个表达。每个 seed 的 20/100/200 训练样本集嵌套，共用额外的 20 个验证样本；种子固定为 0、1、2，测试图像与训练/验证隔离。
+每个目标域、每个预算及每个种子都应从同一 RIS-LAD 源模型独立开始；不是从另一个目标域或较小预算继续训练。
 
-</details>
+阶段1冻结骨干和 BERT，任务模块学习率为 `1e-4`；阶段2解冻骨干，其学习率为 `1e-6`，任务模块为 `1e-5`，BERT 始终冻结。
+batch size 2、无梯度累积、启用 AMP 和 DN、禁止翻转。每 50 次成功更新验证一次；连续3次未提升至少0.1个百分点时切换阶段，阶段1最多300次更新。
+阶段2每3次停滞将学习率乘0.1，连续6次停滞早停；两阶段总预算1000次更新。阶段切换重置停滞计数，最终按小样本验证 mIoU 保存 `best.pth`。
+`--eval-test` 只在训练完成后对选出的最佳权重测试一次，不参与模型选择。
 
-### 4. Evaluate
+目标域配置专用于 `tools/finetune.py`，普通 `tools/train.py` 会拒绝这些配置，避免误用完整目标域数据替代小样本协议。
 
-Evaluate on the validation set:
-
-```bash
-python tools/train.py --config configs/b0_hed_rislad.py --eval-only --resume work_dirs/b0_hed_rislad_noDN/best.pth --opts gdino_ckpt=None
-```
-
-For final testing, explicitly select the test annotations. Continue to use validation data for model selection during training:
-
-```bash
-python tools/train.py --config configs/b0_hed_rislad.py --eval-only --resume work_dirs/b0_hed_rislad_noDN/best.pth --opts gdino_ckpt=None val_data.path=data/RIS-LAD/b0/test.jsonl output_dir=work_dirs/test_rislad
-```
-
-Metrics include mIoU, oIoU, and Prec@0.5/0.6/0.7/0.8/0.9. Masks are restored to the original image size and binarized with probability `> 0.5`; Prec@X uses `IoU >= X`.
-
-### 5. Predict
-
-```bash
-python tools/infer.py --ckpt work_dirs/b0_hed_rislad_noDN/best.pth --image example.jpg --text "the white car on the left" --out work_dirs/prediction.jpg
-```
-
-The command saves an overlay and a corresponding `_mask.png` binary mask. Model settings are restored from the checkpoint. Use `--hed-mask-mode avg` or `last` to select mask aggregation. The default resize targets a shorter side of 800 pixels and a maximum longer side of 1333; override with `--short-side` and `--max-size`.
-
-## Code Guide
-
-<details>
-<summary><b>Repository structure</b></summary>
-
-```text
-MRENet/
-├── configs/        Dataset, model, and diagnostic configurations
-├── rrs/            Models, training utilities, data, losses, and postprocessing
-├── tools/          Training, evaluation, prediction, conversion, and checks
-├── scripts/        Environment setup, downloads, and CUDA builds
-├── tests/          CPU unit tests
-├── docs/           Implementation and data-conversion notes
-├── assets/         Framework figure, vector PDF, and badges
-├── third_party/    Required upstream sources, versions, and licenses
-├── .github/        Automated checks
-├── requirements.txt
-└── README.md
-```
-
-</details>
-
-| Component | Implementation |
-| :--- | :--- |
-| Main architecture and checkpoint loading | [model.py](rrs/model.py) |
-| Pixel enhancement corresponding to MCPE | [mmscope_pixel_decoder.py](rrs/mmscope_pixel_decoder.py) |
-| Shared parallel decoder corresponding to SPED | [hed_decoder.py](rrs/hed_decoder.py) |
-| RCA candidate-scoring head | [ref_score_head.py](rrs/ref_score_head.py) |
-| Denoising queries and branch sampling | [dn.py](rrs/dn.py) |
-| Matching and training losses | [criterion.py](rrs/criterion.py) |
-| Candidate selection, mask restoration, and metrics | [evaluate.py](rrs/evaluate.py) |
-| Dataset and preprocessing | [data.py](rrs/data.py) · [preprocess.py](rrs/preprocess.py) |
-| Configuration and training utilities | [config.py](rrs/config.py) · [training.py](rrs/training.py) |
-| Training and evaluation entry point | [train.py](tools/train.py) |
-| Single-image prediction | [infer.py](tools/infer.py) |
-
-<details>
-<summary><b>Development checks and GPU validation</b></summary>
-
-CPU unit tests and syntax checks:
+## 检查
 
 ```bash
 python -m unittest discover -s tests -v
-python -m compileall -q rrs tools configs tests
 ```
 
-Tests do not download pretrained weights. MMSCopE shape and wiring tests use stubs and do not validate the CUDA scan kernel. The [GitHub Actions workflow](.github/workflows/tests.yml) runs CPU tests and syntax checks.
-
-With the required datasets, weights, and GPU environment:
+包括真实选择性扫描与逐时间步递推的输出/梯度对照、非方形特征的前后向、逐组不同查询的选择与融合、DN 隔离、各层匹配监督和权重加载规则。
+可以在不下载权重和数据的情况下运行缩小模型的合成检查：
 
 ```bash
-python tools/check_b0.py --config configs/b0_refcoco.py
-python tools/smoke_dn.py --config configs/b0_hed_dn_rislad.py --iters 2
-python tools/smoke_mm_score.py --config configs/b0_hed_mm_score_rislad.py --iters 2
-bash scripts/verify_mm_score.sh
+python tools/smoke_synthetic.py
 ```
 
-These checks validate the execution pipeline, not complete training or benchmark performance.
+需要真实数据和完整预训练权重的训练冒烟检查为：
 
-</details>
-
-## Citation
-
-Please cite the corresponding manuscript when using this work. Update the publication metadata once the paper is formally published.
-
-```bibtex
-@unpublished{zhang2026mrenet,
-  title  = {Low-Altitude UAV Referring Image Segmentation via Multiscale
-            Contextual Pixel Enhancement and Referentially Guided
-            Ensemble Prediction},
-  author = {Zhang, Shuo and Chen, Quanzhen and Yu, Li and Li, Ming and
-            Pan, Haoyu and Li, Yilin and Shi, Zhiyi and Wu, Edmond Q.},
-  year   = {2026},
-  note   = {Manuscript}
-}
+```bash
+python tools/smoke_mm_score.py --config configs/mrenet_rislad.py
 ```
 
-## Acknowledgements and License
+历史 MCPE 原型权重的扫描结构与本版不同，不能保证直接恢复。建议从 GroundingDINO 预训练权重重新训练，或显式使用 `--init-from` 从 FPN 基线初始化。
+本版修改后的选择规则也会改变旧模型的推理结果；测试通过不代表复现了论文精度或运行速度。
 
-This project builds on [GroundingDINO](https://github.com/IDEA-Research/GroundingDINO) and uses or draws on implementations from SegMAN / MMSCopE, Open-GroundingDino, and FT-FSOD. See [third-party sources and licenses](third_party/README.md) for provenance, recorded versions, and retained files.
-
-Adaptation details are recorded in the [HED and DN notes](docs/HED_DN接入说明_20261013.md) and [pixel-decoder and scoring-head notes](docs/MMSCopE与评分头接入说明_20261016.md). Upstream copyright notices and licenses are retained. A top-level license for the original project code has not yet been specified.
-
-<p align="center"><a href="#mrenet">Back to top ↑</a></p>
+第三方基础组件及许可证见 [third_party/README.md](third_party/README.md)。

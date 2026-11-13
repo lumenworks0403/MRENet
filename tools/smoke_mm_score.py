@@ -14,7 +14,7 @@ grad_accum 压到 min(cfg.grad_accum, iters) 以保证本次测试内至少一�
 (正式训练仍用配置值, 生产逻辑未改)。AMP 关闭时走同一条代码路径 (scaler.enabled=False)。
 
 检查 (结果打印为 JSON, 任一失败则 exit 1):
-  1. 模式与实际模型一致; MM 开启时像素支路确实是 MMSCopEPixelDecoder 且含真实 SS2D 参数。
+  1. 模式与实际模型一致; MM 开启时像素支路确实是 MCPEPixelDecoder 且含真实 SS2D 参数。
   2. 训练前向: 评分字段形状 (B,Q) / (L,B,Q); DN 开启时评分只覆盖普通查询。
   3. 总损失有限; **评分损失进入 total loss 的数值等式**: 固定并恢复同一份 CPU+CUDA 随机状态后
      两次调用 criterion, 断言 total 差值 ≈ Σ(各层评分损失)×权重 (容差内), 且其余损失项逐项不变。
@@ -251,11 +251,11 @@ def main():
     report["has_ref_score_head"] = model.ref_score_head is not None
     if cfg["use_mmscope"]:
         names = [n for n, _ in model.pixel_decoder.named_parameters()]
-        # 真实 SS2D 的参数名 (官方 VSSM): A_logs / Ds / x_proj_weight / dt_projs_weight
+        # 项目内 SS2D 的核心参数名: A_logs / Ds / x_proj_weight / dt_projs_weight
         ss2d = [n for n in names if "token_mixer" in n]
         report["ss2d_param_names"] = sorted(n for n in ss2d if any(
             k in n for k in ("A_logs", "Ds", "x_proj_weight", "dt_projs_weight", "dt_projs_bias")))
-        ok &= type(model.pixel_decoder).__name__ == "MMSCopEPixelDecoder"
+        ok &= type(model.pixel_decoder).__name__ == "MCPEPixelDecoder"
         ok &= len(report["ss2d_param_names"]) == 5
         report["mm_params_M"] = round(
             sum(p.numel() for p in model.pixel_decoder.parameters()) / 1e6, 3)

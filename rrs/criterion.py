@@ -18,7 +18,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 from scipy.optimize import linear_sum_assignment
 
-from .model import _GD_ROOT  # noqa: F401  (确保 groundingdino 在 sys.path 中)
+import sys
+from pathlib import Path
+
+_GD_ROOT = str(Path(__file__).resolve().parents[1] / "third_party" / "GroundingDINO")
+if _GD_ROOT not in sys.path:
+    sys.path.insert(0, _GD_ROOT)
 from groundingdino.util import box_ops
 from .dn import dn_target_indices
 from .tensor_ops import sigmoid_focal_loss
@@ -34,7 +39,8 @@ def build_positive_map(tokenized, max_text_len=256):
     pos &= ids != 102  # [SEP]
     pos &= ids != 1012  # '.'
     out = torch.zeros(ids.shape[0], max_text_len, device=ids.device)
-    out[:, :ids.shape[1]] = pos.float()
+    length = min(ids.shape[1], max_text_len)
+    out[:, :length] = pos[:, :length].float()
     return out
 
 
@@ -263,18 +269,11 @@ class SetCriterion(nn.Module):
         return total, losses, indices
 
     def loss_dn_single(self, logits, boxes, targets, meta, pos_map, text_mask):
-        """一层 DN 损失, 迁移自官方 grounding_dino_head_HED.py::_loss_dn_single /
-        _get_dn_targets_single (同 dino_head.py 的定位规则)。
+        """第 3.6 节的 DN 重建损失，不进行 Hungarian 匹配。
 
-        监督直接按该层自己的 metadata 定位, 不做匹配:
-          正样本 DN (每组前 M 个中的前 n_b 个): 分类目标 = 该描述的 positive token map
-              (方案 A: 一条描述的所有目标共用同一组正 token), 另算 L1 + GIoU 对应 GT 框。
-          负样本 DN 与 padding 位: 分类目标全 0 (label_weights 官方全为 1, padding 也计入),
-              不算框损失。
-        归一化: 分类与框损失都除以 batch 内正样本 DN 总数 (至少 1)。官方 bg_cls_weight=0,
-              所以 cls_avg_factor 也等于正样本数。单卡训练, 不做 reduce_mean。
-        与官方的差异: GIoU 在归一化坐标上算 (与 B0 普通查询 loss_boxes 一致),
-              官方在像素坐标上算; 宽高比不为 1 时两者数值略有不同。
+        正 DN 监督表达 token 和原始框；负 DN 及 padding 只监督零分类目标。
+        按该层布局定位，并按 batch 有效正 DN 数量归一化，分母至少为 1。
+        GIoU 使用归一化坐标；同时缩放预测框与 GT 框不改变 GIoU。
         """
         logits = logits.float()
         boxes = boxes.float()

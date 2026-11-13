@@ -1,14 +1,4 @@
-"""推理后处理与指代分割评估指标。
-
-B0_HED 新增:
-  postprocess_hed: HED 推理后处理。
-    - 分类: 6层各自 sigmoid 后对同一查询的概率求均值（不能均值 logits 再 sigmoid）
-    - 框: 6层预测框直接均值
-    - 掩码: 对选定查询逐层计算、累加，再除以层数得均值概率，最后阈值化
-    NOTE: "掩码概率平均"是本项目的分割适配，FT-FSOD 原文无此设计，此处明确注明。
-  2026-10-16: use_ref_score=True 时 top1 查询改由新增 RefScoreHead 的六层 sigmoid 均值决定
-    (原 token 均分降为诊断值 token_scores)。掩码生成、空间恢复与六层概率平均的规则不变。
-"""
+"""逐组指代选择及原图概率掩码融合，对应方法公式 (12)-(16)。"""
 import torch
 import torch.nn.functional as F
 
@@ -16,14 +6,10 @@ from .criterion import build_positive_map
 
 
 def postprocess_for_model(model, outputs, targets, pp=None, hed_mask_mode="avg"):
-    """验证和单图预测共用同一个模式入口，旧模型默认为 B0。
-
-    评分模式取自 **模型实例** 的 use_ref_score (不靠输出里有没有 pred_ref_logits 猜),
-    这样 CLI 配置与实际模型不一致时会报错而不是静默换一套选择规则。"""
     options = dict(pp or {})
     if getattr(model, "use_hed", False):
         if "hed_all_logits" not in outputs or "hed_all_boxes" not in outputs:
-            raise ValueError("HED 模型缺少六层预测，不能回退为单层后处理")
+            raise ValueError("SPED 模型缺少分组预测，不能回退为单层后处理")
         options["mask_mode"] = hed_mask_mode
         options["use_ref_score"] = bool(getattr(model, "use_ref_score", False))
         return postprocess_hed(outputs, targets, **options)
@@ -31,133 +17,107 @@ def postprocess_for_model(model, outputs, targets, pp=None, hed_mask_mode="avg")
 
 
 def _restore_mask(m, pad_hw, h, w, h0, w0):
-    """与原 B0 postprocess 相同的空间恢复: 恢复 padding 画布 → 裁掉 padding → 恢复原图。
-    m: (1, K, H/4, W/4) logits, 返回 (K, h0, w0) logits。"""
+    """先恢复 padding 画布并裁去 padding，再恢复原图，返回 logits。"""
     m = F.interpolate(m, size=pad_hw, mode="bilinear", align_corners=False)[..., :h, :w]
     return F.interpolate(m, size=(h0, w0), mode="bilinear", align_corners=False)[0]
+
+
+def _token_scores(logits, tokenized):
+    """TM 消融：每个候选取有效表达 token 的最大 sigmoid 概率。"""
+    eligible = build_positive_map(tokenized, max_text_len=logits.shape[-1]).to(logits.device).bool()
+    while eligible.ndim < logits.ndim:
+        eligible = eligible.unsqueeze(-2)
+    return logits.float().sigmoid().masked_fill(~eligible, 0.0).amax(-1)
 
 
 @torch.no_grad()
 def postprocess_hed(outputs, targets, mode="top1", score_thr=0.3, max_dets=50, mask_mode="avg",
                     use_ref_score=False):
-    """HED 推理后处理。
+    """SPED 的每一组各选一个候选；恢复六张 logits 后 sigmoid，再等权平均。
 
-    use_ref_score=False (默认): 查询分数 = 六层 token 分类概率均值在描述正 token 上的均分
-              (原路径, 与 2026-10-13 版逐元素相同)。
-    use_ref_score=True: 查询分数 = 六层 pred_ref_logits 分别 sigmoid 后求均值 (新评分头,
-              见 model.py / ref_score_head.py)。选中的 q* 完全由新分数决定, 旧 token 均分
-              仍然计算并作为 "token_scores" 随结果返回, 只作诊断, 不参与选择, 也不做加权融合。
-              缺少 hed_all_ref_logits 时报错, 不静默退回旧分数。
-
-    分类分数 (旧路径): 6层各自 sigmoid 后对同一查询的概率求均值（先 sigmoid 再均值，
-              与官方 predict_by_feat 中 all_layers_cls_scores.sigmoid().mean(0) 一致）。
-    框: 6层预测框均值（官方同策略）。
-    掩码 (mask_mode="avg", 默认): 按汇总分数选出查询后, 只对这些查询逐层计算掩码,
-          每层恢复到原图后 sigmoid, 六层概率平均, 再按 0.5 阈值化。
-          NOTE: "掩码概率平均"是本项目分割适配，FT-FSOD 原文无此设计。
-    掩码 (mask_mode="last"): 只用最后一层掩码, 用于对照。
-    空间恢复顺序: 恢复 padding 画布 → 裁掉 padding → 恢复原图（与原 B0 一致）。
-    选择查询只依据模型预测分数, 不使用真实标注。
-
-    输出字典需含 hed_all_logits / hed_all_boxes, mask_mode="avg" 时还需
-    hed_mask_embeds / hed_pix (仅 eval 模式前向会给出)。
-    若无 hed_all_logits（use_hed=False 的模型），回退到原 postprocess。
+    queries/scores 为逐组的索引/分数；prob_mask 和 inst_masks 是最终融合结果。
+    selected_boxes 保留各组选中的框；boxes 中的均值框仅用于兼容框诊断。
+    mask_mode='last' 为仅使用最后一组的消融，不改变组内选取规则。
     """
-    if "hed_all_logits" not in outputs:
-        return postprocess(outputs, targets, mode=mode, score_thr=score_thr, max_dets=max_dets)
-    assert mask_mode in ("avg", "last"), mask_mode
-    # 本阶段 HED 后处理只支持单目标 top1: multi 会把不同查询的掩码取并集,
-    # 超出当前约束。需要 multi 时应先单独设计并审查, 不能静默合并。
     if mode != "top1":
-        raise NotImplementedError(f"HED-structure/no-DN 后处理目前只支持 mode='top1' (当前 {mode!r})")
-    if mask_mode == "avg" and outputs.get("hed_mask_embeds") is None:
-        raise ValueError("mask_mode='avg' 需要 eval 模式前向输出的 hed_mask_embeds")
-
-    all_logits = outputs["hed_all_logits"]  # (6, B, Q, T)
-    all_boxes = outputs["hed_all_boxes"]  # (6, B, Q, 4)
-
-    # 各层分别 sigmoid，再对同一查询平均概率。
-    # nan_to_num(0.0) 与原 B0 postprocess 一致, 在逐层 sigmoid 之后、平均之前做;
-    # 有限输入时结果不变。
-    probs_avg = all_logits.sigmoid().nan_to_num(0.0).mean(0)  # (B, Q, T)
-    boxes_avg = all_boxes.mean(0)  # (B, Q, 4)
-
-    pos_map = build_positive_map(outputs["tokenized"]).to(probs_avg.device)
-    pm = pos_map / pos_map.sum(-1, keepdim=True).clamp(min=1)
-    token_score = torch.einsum("bqt,bt->bq", probs_avg.float(), pm)  # (B, Q) 旧 token 均分
-
+        raise NotImplementedError("SPED/RCA 论文路径只支持单目标 top1")
+    if mask_mode not in ("avg", "last"):
+        raise ValueError("mask_mode 必须为 'avg' 或 'last'")
+    for key in ("hed_all_logits", "hed_all_boxes", "hed_mask_embeds", "hed_pix"):
+        if outputs.get(key) is None:
+            raise ValueError(f"SPED 后处理缺少 {key}，需要 eval 前向的逐组输出")
+    all_logits = outputs["hed_all_logits"]
+    all_boxes = outputs["hed_all_boxes"]
+    embeds = outputs["hed_mask_embeds"]
+    pix = outputs["hed_pix"]
+    if all_logits.ndim != 4 or all_boxes.shape != (*all_logits.shape[:3], 4):
+        raise ValueError("分组预测应为 (L,B,Q,T) 和 (L,B,Q,4)")
+    if embeds.shape[:3] != all_logits.shape[:3]:
+        raise ValueError("分组掩码嵌入必须与候选组、batch 和查询维一致")
+    if not torch.isfinite(all_boxes).all() or not torch.isfinite(
+            embeds).all() or not torch.isfinite(pix).all():
+        raise FloatingPointError("非有限的候选框或掩码特征")
+    token_scores = torch.stack([_token_scores(layer, outputs["tokenized"]) for layer in all_logits])
     if use_ref_score:
         if outputs.get("hed_all_ref_logits") is None:
             raise ValueError("use_ref_score=True 但模型输出缺少 hed_all_ref_logits")
-        # 沿用 HED 的"同一查询索引、各层先 sigmoid 再平均"约定 (继承的设计假设:
-        # 六层同一索引视作同一候选; 本次不新增跨分支候选聚类)。
-        score = outputs["hed_all_ref_logits"].float().sigmoid().mean(0)  # (B, Q)
+        ref_logits = outputs["hed_all_ref_logits"]
+        if ref_logits.shape != all_logits.shape[:3] or not torch.isfinite(ref_logits).all():
+            raise ValueError("RCA 分数必须是有限的 (L,B,Q) logits")
+        score = ref_logits.float().sigmoid()
+        # argmax(logits) 与 argmax(sigmoid(logits)) 数学等价；前者避免极端值饱和导致假并列。
+        selections = ref_logits.float().argmax(-1)
     else:
-        score = token_score
-
+        score = token_scores
+        selections = score.argmax(-1)
+    layer_ids = torch.arange(all_logits.shape[0], device=all_logits.device)
     pad_hw = outputs["pad_mask"].shape[-2:]
     results = []
-    for b, t in enumerate(targets):
-        keep = score[b].argmax()[None]  # top1 (multi 已在入口拒绝)
-
-        h, w = t["size"].tolist()
-        h0, w0 = t["orig_size"].tolist()
-
-        if len(keep):
-            if mask_mode == "avg":
-                # 只对选中的查询逐层计算掩码: 每层先做与 B0 相同的空间恢复
-                # (padding 画布 → 裁 padding → 原图), 再 sigmoid 累加, 最后除以层数。
-                embeds = outputs["hed_mask_embeds"][:, b, keep]  # (6, K, C)
-                pix = outputs["hed_pix"][b]  # (C, H/4, W/4)
-                prob_sum = None
-                for lid in range(embeds.shape[0]):
-                    m = torch.einsum("kc,chw->khw", embeds[lid], pix)[None].float()
-                    m = _restore_mask(m, pad_hw, h, w, h0, w0)
-                    p = m.sigmoid()
-                    prob_sum = p if prob_sum is None else prob_sum + p
-                prob = prob_sum / embeds.shape[0]
-            else:
-                # 对照选项: 只用最后一层掩码 (与原 B0 取法相同)
-                m = outputs["pred_masks"][b, keep][None].float()
-                prob = _restore_mask(m, pad_hw, h, w, h0, w0).sigmoid()
-            inst = prob > 0.5  # (1, h0, w0)
-            union = inst[0]  # top1: K=1, 不做跨查询并集
-        else:
-            inst = torch.zeros((0, h0, w0), dtype=torch.bool, device=score.device)
-            union = torch.zeros((h0, w0), dtype=torch.bool, device=score.device)
-
-        boxes = []
-        for q in keep.tolist():
-            cx, cy, bw, bh = boxes_avg[b, q].tolist()
-            boxes.append([(cx - bw / 2) * w0, (cy - bh / 2) * h0, (cx + bw / 2) * w0,
-                          (cy + bh / 2) * h0])
-        # scores 始终是"实际用于选 q* 的分数"; 新模式下额外给出旧 token 均分作诊断,
-        # score_type 标明含义, 避免对外展示的分数与选择依据不一致。
-        r = {
-            "mask": union,
-            "inst_masks": inst,
-            "boxes": boxes,
-            "scores": score[b, keep].tolist(),
+    for b, target in enumerate(targets):
+        keep = selections[:, b]
+        h, w = target["size"].tolist()
+        h0, w0 = target["orig_size"].tolist()
+        selected_embeds = embeds[layer_ids, b, keep]
+        layers = range(len(layer_ids)) if mask_mode == "avg" else [len(layer_ids) - 1]
+        prob_sum = None
+        for lid in layers:
+            logit = torch.einsum("c,chw->hw", selected_embeds[lid], pix[b])[None, None].float()
+            restored = _restore_mask(logit, pad_hw, h, w, h0, w0)[0]
+            probability = restored.sigmoid()
+            prob_sum = probability if prob_sum is None else prob_sum + probability
+        probability = prob_sum / len(layers)
+        selected = all_boxes[layer_ids, b, keep].float()
+        cx, cy, bw, bh = selected.unbind(-1)
+        xyxy = torch.stack(
+            ((cx - bw / 2) * w0, (cy - bh / 2) * h0, (cx + bw / 2) * w0, (cy + bh / 2) * h0), -1)
+        result = {
+            "mask": probability > 0.5,
+            "prob_mask": probability,
+            "inst_masks": (probability > 0.5)[None],
             "queries": keep.tolist(),
-            "score_type": "ref_score" if use_ref_score else "token"
+            "scores": score[layer_ids, b, keep].tolist(),
+            "selected_boxes": xyxy.tolist(),
+            "boxes": xyxy.mean(0, keepdim=True).tolist(),
+            "score_type": "ref_score" if use_ref_score else "token",
         }
         if use_ref_score:
-            r["token_scores"] = token_score[b, keep].tolist()
-        results.append(r)
+            result["token_scores"] = token_scores[layer_ids, b, keep].tolist()
+        results.append(result)
     return results
+
+
+# Paper terminology for callers; legacy entry point remains importable.
+postprocess_sped = postprocess_hed
 
 
 @torch.no_grad()
 def postprocess(outputs, targets, mode="top1", score_thr=0.3, max_dets=50):
-    """每个查询的指代分数 = 其在描述正 token 上的平均 sigmoid 概率。
+    """每个查询的指代分数 = 其在有效描述 token 上的最大 sigmoid 概率。
     mode="top1"  : 单目标指代 (RefCOCO), 取分数最高的 1 个查询。
     mode="multi" : 多目标/无目标指代 (RefDrone), 取分数 > score_thr 的查询 (至多 max_dets 个),
                    最终掩码为这些查询掩码的并集; 若没有查询过阈值则输出空掩码 (预测为无目标)。
     返回原图尺寸的二值掩码 (并集) 以及各实例的框 / 分数。"""
-    pos_map = build_positive_map(outputs["tokenized"]).to(outputs["pred_logits"].device)
-    prob = outputs["pred_logits"].sigmoid().nan_to_num(0.0)  # (B, Q, 256)
-    pm = pos_map / pos_map.sum(-1, keepdim=True).clamp(min=1)
-    score = torch.einsum("bqt,bt->bq", prob.float(), pm)
+    score = _token_scores(outputs["pred_logits"], outputs["tokenized"])
     pad_hw = outputs["pad_mask"].shape[-2:]
     results = []
     for b, t in enumerate(targets):

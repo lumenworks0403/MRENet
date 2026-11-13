@@ -1,0 +1,35 @@
+{
+  "python": "3.12.14",
+  "torch": "2.8.0+cpu",
+  "device": "cpu",
+  "syntax_files": 95,
+  "tests_run": 111,
+  "tests_failed": 0,
+  "tests_errors": 0,
+  "tests_skipped": 0,
+  "synthetic": {
+    "passed": true,
+    "device": "cpu",
+    "torch": "2.8.0+cpu",
+    "training_loss": 2489.114013671875,
+    "loss_terms": 57,
+    "ordinary_queries": 8,
+    "dn_queries": 4,
+    "selected_queries": [
+      2,
+      4,
+      4,
+      5,
+      7,
+      6
+    ],
+    "output_shape": [
+      64,
+      96
+    ]
+  },
+  "limits": [
+    "未进行 CUDA/AMP 实机验证",
+    "未进行真实数据集训练和论文指标复现"
+  ]
+}

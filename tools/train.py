@@ -62,6 +62,8 @@ def main():
     if args.init_from and args.eval_only:
         sys.exit("--init-from 不能与 --eval-only 同用: 新增模块是随机初始化的, 不能当成完整模型评估")
     cfg = load_cfg(args.config, args.opts)
+    if cfg.get("adaptation_only", False):
+        ap.error("目标域两阶段配置请使用 tools/finetune.py；普通 epoch 训练不等同论文迁移流程")
     # 必须先读模式再构建模型；相同参数名称不能区分串行/并行结构。
     ck = torch.load(args.resume, map_location="cpu") if args.resume else None
     # --init-from 只取权重: 结构由新配置决定, 因此这里不把它的 cfg 传给 resolve_model_mode。

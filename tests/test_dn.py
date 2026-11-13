@@ -284,10 +284,8 @@ class TestDecoderDN(unittest.TestCase):
                     self.assertFalse(
                         torch.allclose(out["input_refs"][i][:, :n],
                                        branch[j - 1].bbox_unsig.sigmoid(), atol=1e-4))
-        # official_raw: 照搬官方, 分支 DN 参考框 = 未 sigmoid 的值
-        _, branch, out = self._run(1.0, mode="official_raw")
-        self.assertTrue(torch.allclose(out["input_refs"][1][:, :n], branch[0].bbox_unsig,
-                                       atol=1e-6))
+        with self.assertRaises(ValueError):
+            self._run(1.0, mode="unnormalized")
 
     def test_rate_half_reproducible(self):
         _, b1, o1 = self._run(0.5, seed=3)
