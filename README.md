@@ -4,8 +4,8 @@
 
 ### Low-Altitude UAV Referring Image Segmentation<br>via Multiscale Contextual Pixel Enhancement<br>and Referentially Guided Ensemble Prediction
 
-**Shuo Zhang · Quanzhen Chen · Li Yu · Ming Li**<br>
-**Haoyu Pan · Yilin Li · Zhiyi Shi · Edmond Q. Wu**
+**Shuo Zhang · Quanzhen Chen · Ming Li · Mengyu Song**<br>
+**Haoyu Pan · Zhiyi Shi · Edmond Q. Wu**
 
 **Multiscale context. Parallel decoding. Referential candidate selection.**
 
@@ -72,23 +72,12 @@ Built on GroundingDINO, the framework uses **MCPE** to enhance pixel representat
 
 MRENet connects **pixel enhancement**, **complementary candidate generation**, and **referential selection** in one segmentation pipeline.
 
-```mermaid
-flowchart LR
-    I["UAV image"] --> V["Swin-T visual encoder"]
-    E["Referring expression"] --> T["BERT text encoder"]
-    V --> F["Cross-modal interaction"]
-    T --> F
-    V -->|Shallow detail| P["MCPE pixel features"]
-    F -->|Multiscale visual features| P
-    F --> D["SPED: 1 shared + 5 parallel layers"]
-    D --> Q["Six candidate query sets"]
-    Q --> R["RCA: independent top-1 per set"]
-    R --> M["Six selected mask embeddings"]
-    P --> A["Mask projection and spatial restoration"]
-    M --> A
-    A --> S["Sigmoid per mask"]
-    S --> O["Equal-weight mean > 0.5"]
-```
+<p align="center">
+  <a href="assets/figures/figure1-overview.png">
+    <img src="assets/figures/figure1-overview.png" alt="Figure 1: Overall architecture of the MRENet framework" width="100%">
+  </a>
+</p>
+<p align="center"><sub><b>Figure 1.</b> Overall architecture of the proposed framework for low-altitude referring image segmentation. Original figure from the manuscript.</sub></p>
 
 | Component | Role |
 | :--- | :--- |
@@ -439,7 +428,7 @@ MRENet/
 ├── scripts/        Environment setup, weight downloads, and optional builds
 ├── tests/          Unit and regression tests
 ├── docs/           Implementation, validation, and data-conversion notes
-├── assets/badges/  Project badges
+├── assets/         Manuscript framework figure and project badges
 ├── third_party/    GroundingDINO sources and retained licenses
 ├── requirements.txt
 └── README.md
@@ -502,8 +491,8 @@ Please cite the corresponding manuscript when using this work. Update the public
   title  = {Low-Altitude UAV Referring Image Segmentation via Multiscale
             Contextual Pixel Enhancement and Referentially Guided
             Ensemble Prediction},
-  author = {Zhang, Shuo and Chen, Quanzhen and Yu, Li and Li, Ming and
-            Pan, Haoyu and Li, Yilin and Shi, Zhiyi and Wu, Edmond Q.},
+  author = {Zhang, Shuo and Chen, Quanzhen and Li, Ming and Song, Mengyu and
+            Pan, Haoyu and Shi, Zhiyi and Wu, Edmond Q.},
   year   = {2026},
   note   = {Manuscript}
 }
